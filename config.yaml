@@ -1,0 +1,140 @@
+simulation:
+  start_date: "2025-01-01"
+  end_date: "2025-12-31"
+  timezone: "Europe/Berlin"
+  # Date from which EPEX moved to 15-min DA products for DE-LU
+  da_15min_from: "2025-10-01"
+
+battery:
+  power_mw: 100           # Rated power (MW)
+  energy_mwh: 400         # Usable energy capacity (MWh)
+  rte: 0.90               # Round-trip efficiency (charge_eta × discharge_eta)
+  soc_initial_mwh: 200    # SoC at simulation start
+  soc_target_mwh: 200     # SoC target for ID correction
+  # soc_min_mwh and soc_max_mwh are AUTO-DERIVED from aFRR reservation below.
+  # Do NOT set them here — change afrr.pos_reserved_mw / neg_reserved_mw instead.
+  #   soc_min_mwh = neg_reserved_mw   (floor: always enough energy to discharge)
+  #   soc_max_mwh = energy_mwh − pos_reserved_mw  (ceiling: always room to charge)
+
+# ─── PRIMARY LEVER ──────────────────────────────────────────────────────────
+#
+# optimize_reservation: true   (recommended)
+#   The LP jointly optimises DA dispatch AND aFRR reservation per 4h block.
+#   pos_reserved_mw / neg_reserved_mw become MAXIMUM BOUNDS — the LP can
+#   choose any value from 0 up to these limits for each block independently.
+#   All SoC limits and power headroom constraints are handled inside the LP.
+#
+# optimize_reservation: false
+#   Fixed strategy: bid exactly pos_reserved_mw / neg_reserved_mw at all times.
+#   SoC limits and DA power are derived automatically:
+#     soc_min_mwh        = neg_reserved_mw
+#     soc_max_mwh        = battery.energy_mwh − pos_reserved_mw
+#     da.max_charge_mw   = battery.power_mw  − pos_reserved_mw
+#     da.max_discharge_mw= battery.power_mw  − neg_reserved_mw
+#
+# ─────────────────────────────────────────────────────────────────────────────
+afrr:
+  optimize_reservation: true  # true = LP picks per-4h-block; false = fixed strategy
+  pos_reserved_mw: 50   # MW — fixed bid (false) or maximum bound for LP (true)
+  neg_reserved_mw: 50   # MW — fixed bid (false) or maximum bound for LP (true)
+  # All-or-nothing energy bid prices, tiered by DA price regime.
+  # Boundary between "low DA" and "normal DA" regimes:
+  activation_da_low_threshold: 30.0    # €/MWh
+  #
+  # Upward bid (discharge) — activate when DAME_pos >= bid_pos:
+  #   DA < 0                     →  fixed bid (€/MWh), independent of DA
+  #   0 <= DA < low_threshold    →  DA × factor_low  (more selective during cheap hours)
+  #   DA >= low_threshold        →  DA × factor       (normal regime)
+  activation_bid_factor_pos: 1.5        # normal DA regime
+  activation_bid_factor_pos_low: 2.0    # low DA (0–30 €/MWh)
+  activation_bid_pos_neg_da_eur: 50.0   # negative DA: fixed floor bid (€/MWh)
+  #
+  # Downward bid (charge) — activate when DAME_neg >= -(DA × factor):
+  #   DA < 0                     →  factor applied to negative DA (raises bar for charging)
+  #   0 <= DA < low_threshold    →  low factor (very willing to charge during cheap hours)
+  #   DA >= low_threshold        →  normal factor
+  activation_bid_factor_neg: 0.5        # normal DA regime
+  activation_bid_factor_neg_low: 0.2    # low DA (0–30 €/MWh)
+  activation_bid_factor_neg_neg_da: 2.0 # negative DA regime
+
+cycling:
+  max_cycles_per_day: 3.0       # Hard cap: max discharge throughput per day = 2 × energy_mwh
+  enforce_hard_limit: true      # If false, cycling cap becomes a soft penalty instead
+
+id_correction:
+  # Every aFRR activation is restored individually in the slot exactly 1 hour later.
+  # Conflict rule: if DA at the target slot is in the same direction as the restoration,
+  # the target is slid forward (up to max_lookahead_slots) to avoid stacking.
+  max_lookahead_slots: 32   # max slots (~8h) to search for a non-conflicting target slot
+  fallback_to_da: true      # use DA price when ID price is missing for a slot
+
+# ─── MARKET / COUNTRY ────────────────────────────────────────────────────────
+# One setting controls everything: DA mapcode, aFRR area filter, and ID file.
+# Supported values:
+#   German TSOs : Amprion | 50HzT | TenneT | TransnetBW
+#   Other       : NL | BE | FR
+market: "Amprion"
+
+paths:
+  input_dir: "input_data"
+  output_dir: "output"
+  # All ENTSO-E data: folders of monthly tab-separated (or comma-separated) CSV files
+  da_prices_folder: "Day-ahead prices 2025"
+  afrr_energy_prices_folder: "Prices of Activated Balancing Energy 2025"
+  afrr_activation_folder: "Aggregated Balancing Energy Bids 2025"
+  # aFRR capacity prices — ENTSO-E "Amount and Prices Paid" monthly CSV folder
+  afrr_cap_prices_folder: "AS capacity prices and volumes"
+  # ID last-1h prices — set automatically from 'market' above
+  id_prices: "IntradayContractStatistics_2025_AMP_None.csv"
+
+# ─── GRID CONNECTION RESTRICTIONS ────────────────────────────────────────────
+#
+# Two restriction types can be enabled independently:
+#
+# 1. Import / Export restrictions
+#    Three scenario options (set export_scenario / import_scenario):
+#      "constant"  — restrict the N highest-DA-price hours year-round
+#      "solar"     — restrict export during solar peak hours, summer only
+#                    (Apr–Sep, 09:00–16:00 CET, weekdays only)
+#      "demand"    — restrict import during demand peak hours, winter only
+#                    (Nov–Mar, 17:00–20:00 CET; Dec–Jan also 11:00–14:00, weekdays only)
+#      "none"      — no restriction in this direction
+#    export_restriction_hours / import_restriction_hours:
+#      For "constant" scenario: the number of top DA-price hours to restrict.
+#      Ignored for "solar" / "demand" (the season/time pattern defines the hours).
+#    restriction_max_mw: maximum allowed power during a restricted slot.
+#      0 = full curtailment.  E.g. 50 = battery can still use 50 MW.
+#
+# 2. Ramp rate → aFRR participation cap
+#    aFRR requires full activation within 5 minutes.  A ramp rate limit reduces
+#    how much of rated power can realistically be delivered in that window.
+#    ramp_rate_pct_per_min: e.g. 10 means 10% of power_mw per minute.
+#      Deliverable in 5 min = min(ramp_rate_pct_per_min × 5, 100)% of power_mw.
+#      Set to 100 (or omit) for no ramp-rate restriction.
+#    This cap is applied to BOTH the aFRR capacity reservation bound (LP) AND
+#    the activated volume in Phase 2 (can't physically deliver more than ramp allows).
+
+grid_connection:
+  # Export (discharge) restriction
+  export_scenario: "none"        # "none" | "constant" | "solar"
+  export_restriction_hours: 500  # used only for "constant" scenario
+  export_restriction_max_mw: 0   # MW allowed during restriction (0 = full block)
+
+  # Import (charge) restriction
+  import_scenario: "none"        # "none" | "constant" | "demand"
+  import_restriction_hours: 500  # used only for "constant" scenario
+  import_restriction_max_mw: 0   # MW allowed during restriction (0 = full block)
+
+  # Ramp rate → aFRR cap
+  ramp_rate_pct_per_min: 100     # % of power_mw per minute (100 = unrestricted)
+
+output:
+  schedule_file: "schedule_15min_2025.csv"
+  daily_summary_file: "summary_daily_2025.csv"
+  monthly_summary_file: "summary_monthly_2025.csv"
+  kpi_report_file: "kpi_report_2025.txt"
+  kpi_restrictions_file: "kpi_restrictions_2025.txt"
+  tso_production_plan_file: "tso_production_plan_2025.csv"
+  charts_dir: "charts"
+  # Sample week for the detailed chart (YYYY-MM-DD, must be a Monday)
+  sample_week_start: "2025-01-06"
