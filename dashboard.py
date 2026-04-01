@@ -377,8 +377,8 @@ with tab_restrictions:
             title="% of Slots Restricted — by Hour of Day",
             height=280, barmode="group",
             yaxis_title="% of slots restricted",
-            xaxis=dict(showgrid=True, gridcolor="#eee", tickmode="linear", dtick=2, title="Hour (CET)"),
         )
+        fig.update_xaxes(showgrid=True, gridcolor="#eee", tickmode="linear", dtick=2, title="Hour (CET)")
         st.plotly_chart(fig, use_container_width=True)
 
     # ── Monthly restriction hours ─────────────────────────────────────────────
