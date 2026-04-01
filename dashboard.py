@@ -19,9 +19,10 @@ from plotly.subplots import make_subplots
 # Config
 # ---------------------------------------------------------------------------
 _HERE = Path(__file__).parent
-SCHEDULE_FILE = _HERE / "output/schedule_15min_2025.csv"
-CONFIG_FILE   = _HERE / "config.yaml"
-ENERGY_MWH    = 400.0
+SCHEDULE_FILE  = _HERE / "output/schedule_15min_2025.csv"
+BASELINE_FILE  = _HERE / "output/schedule_15min_baseline_2025.csv"
+CONFIG_FILE    = _HERE / "config.yaml"
+ENERGY_MWH     = 400.0
 
 COLOURS = {
     "da":        "#2196F3",
@@ -86,12 +87,21 @@ def load_config(path: Path) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
+@st.cache_data
+def load_baseline(path: Path) -> pd.DataFrame | None:
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, parse_dates=["timestamp"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Europe/Berlin")
+    return df.sort_values("timestamp").reset_index(drop=True)
+
 if not SCHEDULE_FILE.exists():
     st.error(f"Output file not found: `{SCHEDULE_FILE}`. Run `python main.py` first.")
     st.stop()
 
-df  = load_data(SCHEDULE_FILE)
-cfg = load_config(CONFIG_FILE)
+df       = load_data(SCHEDULE_FILE)
+baseline = load_baseline(BASELINE_FILE)
+cfg      = load_config(CONFIG_FILE)
 
 # ---------------------------------------------------------------------------
 # Tabs
@@ -268,6 +278,15 @@ with tab_restrictions:
     h_exp    = n_exp * DT
     h_imp    = n_imp * DT
     n_total  = len(df)
+    neither  = ~(exp_mask | imp_mask)
+
+    # Derive scenario labels from actual data (config.yaml may be stale)
+    exp_scenario_label = gc.get("export_scenario", "none").upper()
+    imp_scenario_label = gc.get("import_scenario", "none").upper()
+    if n_exp > 0 and exp_scenario_label == "NONE":
+        exp_scenario_label = "ACTIVE"
+    if n_imp > 0 and imp_scenario_label == "NONE":
+        imp_scenario_label = "ACTIVE"
 
     any_restriction = (n_exp > 0 or n_imp > 0 or ramp_limited)
 
@@ -276,11 +295,9 @@ with tab_restrictions:
     # ── Configuration summary ─────────────────────────────────────────────────
     st.markdown("### Configuration")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Export scenario",
-              gc.get("export_scenario", "none").upper(),
+    c1.metric("Export scenario", exp_scenario_label,
               help="solar = Apr–Sep 09–16h weekdays; constant = top-N DA-price hours; none = no restriction")
-    c2.metric("Import scenario",
-              gc.get("import_scenario", "none").upper(),
+    c2.metric("Import scenario", imp_scenario_label,
               help="demand = Nov–Mar 17–20h (+ Dec/Jan 11–14h) weekdays; constant = top-N; none = no restriction")
     c3.metric("Ramp rate",
               f"{ramp_pct:.0f}% / min",
@@ -289,9 +306,9 @@ with tab_restrictions:
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Export max power (restricted)", f"{exp_max_mw:.0f} MW",
-              delta="Full curtailment" if exp_max_mw == 0 else None, delta_color="off")
+              delta="Full curtailment" if exp_max_mw == 0 and n_exp > 0 else None, delta_color="off")
     c2.metric("Import max power (restricted)", f"{imp_max_mw:.0f} MW",
-              delta="Full curtailment" if imp_max_mw == 0 else None, delta_color="off")
+              delta="Full curtailment" if imp_max_mw == 0 and n_imp > 0 else None, delta_color="off")
     c3.metric("aFRR cap (pos / neg)",
               f"{pos_cap_eff:.0f} / {neg_cap_eff:.0f} MW",
               delta=f"Config: {pos_max_cfg:.0f}/{neg_max_cfg:.0f} MW" if ramp_limited else "Unrestricted",
@@ -314,7 +331,6 @@ with tab_restrictions:
               delta=f"{n_imp/n_total*100:.1f}% of year", delta_color="off")
 
     # Average DA price in restricted vs free slots
-    neither = ~(exp_mask | imp_mask)
     da_exp  = df.loc[exp_mask, "da_price_eur_mwh"].mean() if n_exp > 0 else float("nan")
     da_imp  = df.loc[imp_mask, "da_price_eur_mwh"].mean() if n_imp > 0 else float("nan")
     da_free = df.loc[neither,  "da_price_eur_mwh"].mean()  if neither.any() else float("nan")
@@ -330,8 +346,6 @@ with tab_restrictions:
 
     # ── Restriction timeline ───────────────────────────────────────────────────
     st.markdown("### Restriction Timeline")
-
-    # Resample to daily sums (in hours)
     df_ts = df.set_index("timestamp")
     daily_exp = (df_ts["grid_export_restricted"].resample("D").sum() * DT).reset_index()
     daily_imp = (df_ts["grid_import_restricted"].resample("D").sum() * DT).reset_index()
@@ -347,14 +361,10 @@ with tab_restrictions:
             x=daily_imp["timestamp"], y=daily_imp["grid_import_restricted"],
             name="Import-restricted (h/day)", marker_color=COLOURS["imp_res"], opacity=0.8,
         ))
-    fig.update_layout(
-        **LAYOUT,
-        title="Restriction Hours per Day",
-        height=280, barmode="overlay", yaxis_title="h/day",
-    )
+    fig.update_layout(**LAYOUT, title="Restriction Hours per Day", height=280, barmode="overlay", yaxis_title="h/day")
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Hour-of-day heatmap ───────────────────────────────────────────────────
+    # ── Hour-of-day profile ───────────────────────────────────────────────────
     if n_exp > 0 or n_imp > 0:
         st.markdown("### Hour-of-Day Profile")
         df["hour"] = df["timestamp"].dt.hour
@@ -363,25 +373,17 @@ with tab_restrictions:
 
         fig = go.Figure()
         if n_exp > 0:
-            fig.add_trace(go.Bar(
-                x=hourly_exp_pct.index, y=hourly_exp_pct.values,
-                name="Export restricted (%)", marker_color=COLOURS["exp_res"], opacity=0.8,
-            ))
+            fig.add_trace(go.Bar(x=hourly_exp_pct.index, y=hourly_exp_pct.values,
+                name="Export restricted (%)", marker_color=COLOURS["exp_res"], opacity=0.8))
         if n_imp > 0:
-            fig.add_trace(go.Bar(
-                x=hourly_imp_pct.index, y=hourly_imp_pct.values,
-                name="Import restricted (%)", marker_color=COLOURS["imp_res"], opacity=0.8,
-            ))
-        fig.update_layout(
-            **LAYOUT,
-            title="% of Slots Restricted — by Hour of Day",
-            height=280, barmode="group",
-            yaxis_title="% of slots restricted",
-        )
+            fig.add_trace(go.Bar(x=hourly_imp_pct.index, y=hourly_imp_pct.values,
+                name="Import restricted (%)", marker_color=COLOURS["imp_res"], opacity=0.8))
+        fig.update_layout(**LAYOUT, title="% of Slots Restricted — by Hour of Day",
+                          height=280, barmode="group", yaxis_title="% of slots restricted")
         fig.update_xaxes(showgrid=True, gridcolor="#eee", tickmode="linear", dtick=2, title="Hour (CET)")
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── Monthly restriction hours ─────────────────────────────────────────────
+    # ── Monthly breakdown ─────────────────────────────────────────────────────
     st.markdown("### Monthly Breakdown")
     df["month"] = df["timestamp"].dt.to_period("M").astype(str)
     monthly_exp_h = df.groupby("month")["grid_export_restricted"].sum() * DT
@@ -389,95 +391,132 @@ with tab_restrictions:
 
     fig = go.Figure()
     if n_exp > 0:
-        fig.add_trace(go.Bar(
-            x=monthly_exp_h.index, y=monthly_exp_h.values,
-            name="Export-restricted (h)", marker_color=COLOURS["exp_res"], opacity=0.85,
-        ))
+        fig.add_trace(go.Bar(x=monthly_exp_h.index, y=monthly_exp_h.values,
+            name="Export-restricted (h)", marker_color=COLOURS["exp_res"], opacity=0.85))
     if n_imp > 0:
-        fig.add_trace(go.Bar(
-            x=monthly_imp_h.index, y=monthly_imp_h.values,
-            name="Import-restricted (h)", marker_color=COLOURS["imp_res"], opacity=0.85,
-        ))
-    fig.update_layout(
-        **LAYOUT,
-        title="Monthly Restriction Hours",
-        height=300, barmode="group",
-        yaxis_title="Hours",
-    )
+        fig.add_trace(go.Bar(x=monthly_imp_h.index, y=monthly_imp_h.values,
+            name="Import-restricted (h)", marker_color=COLOURS["imp_res"], opacity=0.85))
+    fig.update_layout(**LAYOUT, title="Monthly Restriction Hours", height=300, barmode="group", yaxis_title="Hours")
     fig.update_xaxes(showgrid=True, gridcolor="#eee")
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Revenue in restricted vs unrestricted slots ───────────────────────────
-    st.markdown("### Revenue Analysis")
-    st.caption(
-        "Revenue earned _during_ restricted slots reflects the LP's optimised dispatch "
-        "under the restriction — it is not 'lost' revenue, but shows how much the "
-        "restriction periods contributed to total income."
-    )
+    # ── Revenue impact vs baseline ────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Revenue Impact vs Unrestricted Baseline")
 
-    rev_da_exp  = df.loc[exp_mask, "revenue_da_eur"].sum()
-    rev_da_imp  = df.loc[imp_mask, "revenue_da_eur"].sum()
-    rev_da_free = df.loc[neither,  "revenue_da_eur"].sum()
-    rev_da_tot  = df["revenue_da_eur"].sum()
-    rev_tot_all = df["revenue_total_eur"].sum()
+    if baseline is None:
+        st.info("No baseline file found. Re-run `python main.py` — it now automatically saves "
+                "`schedule_15min_baseline_2025.csv` when restrictions are active.")
+    else:
+        rev_restricted = df["revenue_total_eur"].sum()
+        rev_baseline   = baseline["revenue_total_eur"].sum()
+        delta_total    = rev_restricted - rev_baseline
 
-    dis_exp  = df.loc[exp_mask, "p_da_mw"].clip(lower=0).mul(DT).sum()
-    dis_free = df.loc[neither,  "p_da_mw"].clip(lower=0).mul(DT).sum()
-    chg_imp  = df.loc[imp_mask, "p_da_mw"].clip(upper=0).abs().mul(DT).sum()
-    chg_free = df.loc[neither,  "p_da_mw"].clip(upper=0).abs().mul(DT).sum()
+        streams = [
+            ("revenue_da_eur",          "Day-Ahead",    COLOURS["da"]),
+            ("revenue_afrr_cap_eur",    "aFRR Capacity",COLOURS["cap"]),
+            ("revenue_afrr_energy_eur", "aFRR Energy",  COLOURS["afrr_up"]),
+            ("revenue_id_eur",          "ID Correction",COLOURS["id"]),
+        ]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("DA revenue — export-restr. slots", f"€{rev_da_exp:,.0f}",
-              delta=f"{rev_da_exp/rev_da_tot*100:.1f}% of total DA" if rev_da_tot != 0 else None,
-              delta_color="off")
-    c2.metric("DA revenue — import-restr. slots", f"€{rev_da_imp:,.0f}",
-              delta=f"{rev_da_imp/rev_da_tot*100:.1f}% of total DA" if rev_da_tot != 0 else None,
-              delta_color="off")
-    c3.metric("DA revenue — free slots",           f"€{rev_da_free:,.0f}",
-              delta=f"{rev_da_free/rev_da_tot*100:.1f}% of total DA" if rev_da_tot != 0 else None,
-              delta_color="off")
+        # Top KPIs
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Baseline revenue (no restrictions)", f"€{rev_baseline:,.0f}")
+        c2.metric("Restricted revenue",                  f"€{rev_restricted:,.0f}")
+        c3.metric("Revenue impact",
+                  f"€{delta_total:,.0f}",
+                  delta=f"{delta_total/rev_baseline*100:.1f}% vs baseline",
+                  delta_color="normal")
+        c4.metric("Revenue / MW impact",
+                  f"€{delta_total/power_mw:,.0f} /MW")
 
-    # Discharge / charge volumes
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("DA discharge — export-restr.", f"{dis_exp:,.0f} MWh")
-    c2.metric("DA discharge — free slots",    f"{dis_free:,.0f} MWh")
-    c3.metric("DA charge — import-restr.",    f"{chg_imp:,.0f} MWh")
-    c4.metric("DA charge — free slots",       f"{chg_free:,.0f} MWh")
+        # Per-stream comparison bar chart
+        stream_names  = [s[1] for s in streams]
+        vals_base     = [baseline[s[0]].sum() for s in streams]
+        vals_restr    = [df[s[0]].sum() for s in streams]
+        deltas        = [r - b_ for r, b_ in zip(vals_restr, vals_base)]
+        colours_list  = [s[2] for s in streams]
 
-    # Revenue stacked bar: restricted vs free
-    fig = go.Figure()
-    categories = []
-    rev_vals   = []
-    colors_bar = []
-    if n_exp > 0:
-        categories.append("Export-restricted")
-        rev_vals.append(rev_da_exp)
-        colors_bar.append(COLOURS["exp_res"])
-    if n_imp > 0:
-        categories.append("Import-restricted")
-        rev_vals.append(rev_da_imp)
-        colors_bar.append(COLOURS["imp_res"])
-    categories.append("Free slots")
-    rev_vals.append(rev_da_free)
-    colors_bar.append(COLOURS["da"])
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=stream_names, y=vals_base,
+            name="Baseline", marker_color=["rgba(33,150,243,0.4)", "rgba(0,188,212,0.4)",
+                                            "rgba(76,175,80,0.4)", "rgba(255,152,0,0.4)"],
+            text=[f"€{v:,.0f}" for v in vals_base], textposition="outside",
+        ))
+        fig.add_trace(go.Bar(
+            x=stream_names, y=vals_restr,
+            name="With restrictions", marker_color=colours_list,
+            text=[f"€{v:,.0f}" for v in vals_restr], textposition="outside",
+        ))
+        fig.update_layout(**LAYOUT, title="Revenue by Stream: Baseline vs Restricted",
+                          height=360, barmode="group", yaxis_title="€")
+        fig.update_xaxes(showgrid=False)
+        st.plotly_chart(fig, use_container_width=True)
 
-    fig.add_trace(go.Bar(
-        x=categories, y=rev_vals,
-        marker_color=colors_bar,
-        text=[f"€{v:,.0f}" for v in rev_vals],
-        textposition="outside",
-    ))
-    fig.update_layout(
-        **LAYOUT,
-        title="DA Revenue: Restricted vs Free Slots",
-        height=320, yaxis_title="€",
-        showlegend=False,
-    )
-    fig.update_xaxes(showgrid=False)
-    st.plotly_chart(fig, use_container_width=True)
+        # Delta table
+        delta_table = pd.DataFrame([
+            {"Stream": name, "Baseline (€)": f"{b_:,.0f}", "Restricted (€)": f"{r:,.0f}",
+             "Delta (€)": f"{d:+,.0f}", "Delta (%)": f"{d/b_*100:+.1f}%" if b_ != 0 else "—"}
+            for (_, name, _), b_, r, d in zip(streams, vals_base, vals_restr, deltas)
+        ] + [{"Stream": "TOTAL",
+              "Baseline (€)": f"{rev_baseline:,.0f}",
+              "Restricted (€)": f"{rev_restricted:,.0f}",
+              "Delta (€)": f"{delta_total:+,.0f}",
+              "Delta (%)": f"{delta_total/rev_baseline*100:+.1f}%"}])
+        st.dataframe(delta_table, use_container_width=True, hide_index=True)
+
+        # ── 15-min schedule deviation chart ───────────────────────────────────
+        st.markdown("### 15-min Schedule: Restricted vs Baseline")
+        st.caption("Select a date range to zoom in on specific restriction periods.")
+
+        date_min_r = df["timestamp"].dt.date.min()
+        date_max_r = df["timestamp"].dt.date.max()
+        dev_range  = st.date_input("Date range (deviation chart)",
+                                   value=(date_min_r, date_max_r),
+                                   min_value=date_min_r, max_value=date_max_r,
+                                   key="dev_range")
+        if isinstance(dev_range, (list, tuple)) and len(dev_range) == 2:
+            dr_start, dr_end = dev_range
+        else:
+            dr_start = dr_end = dev_range[0] if dev_range else date_min_r
+
+        mask_r  = (df["timestamp"].dt.date >= dr_start) & (df["timestamp"].dt.date <= dr_end)
+        mask_b  = (baseline["timestamp"].dt.date >= dr_start) & (baseline["timestamp"].dt.date <= dr_end)
+        df_r    = df[mask_r].copy()
+        df_b    = baseline[mask_b].copy()
+
+        ts_r   = df_r["timestamp"]
+        p_restr = df_r["p_net_mw"].values
+        p_base  = df_b["p_net_mw"].values[:len(p_restr)]
+        p_delta = p_restr - p_base
+
+        # Shade restriction periods
+        exp_r = df_r["grid_export_restricted"].astype(bool).values
+        imp_r = df_r["grid_import_restricted"].astype(bool).values
+
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                            subplot_titles=("Net Power: Restricted vs Baseline (MW)",
+                                            "Deviation: Restricted − Baseline (MW)"))
+
+        fig.add_trace(go.Scatter(x=ts_r, y=p_base,  name="Baseline",    line=dict(color="#aaa", width=1)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=ts_r, y=p_restr, name="Restricted",  line=dict(color=COLOURS["da"],  width=1.2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=ts_r, y=p_delta, name="Δ power",
+                                 fill="tozeroy",
+                                 line=dict(color=COLOURS["exp_res"], width=1),
+                                 fillcolor="rgba(255,87,34,0.15)"), row=2, col=1)
+        fig.add_hline(y=0, line_color="#999", line_width=0.8, row=2, col=1)
+
+        fig.update_layout(plot_bgcolor="white", paper_bgcolor="white", hovermode="x unified",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                          margin=dict(l=60, r=20, t=60, b=40), height=520)
+        fig.update_yaxes(showgrid=True, gridcolor="#eee")
+        fig.update_xaxes(showgrid=True, gridcolor="#eee", tickformat="%b %d")
+        st.plotly_chart(fig, use_container_width=True)
 
     # ── aFRR ramp-rate cap section ────────────────────────────────────────────
     if ramp_limited:
+        st.markdown("---")
         st.markdown("### aFRR Capacity — Ramp Rate Impact")
         st.info(
             f"Ramp rate {ramp_pct:.0f}%/min → max deliverable in 5 min = "
@@ -485,8 +524,8 @@ with tab_restrictions:
             f"(config max: {pos_max_cfg:.0f}/{neg_max_cfg:.0f} MW pos/neg)"
         )
 
-        avg_r_pos = df["p_afrr_pos_reserved_mw"].mean()
-        avg_r_neg = df["p_afrr_neg_reserved_mw"].mean()
+        avg_r_pos    = df["p_afrr_pos_reserved_mw"].mean()
+        avg_r_neg    = df["p_afrr_neg_reserved_mw"].mean()
         afrr_cap_rev = df["revenue_afrr_cap_eur"].sum()
 
         c1, c2, c3 = st.columns(3)
@@ -494,21 +533,16 @@ with tab_restrictions:
                   delta=f"cap at {pos_cap_eff:.0f} MW", delta_color="off")
         c2.metric("Avg neg reserved (actual)", f"{avg_r_neg:.1f} MW",
                   delta=f"cap at {neg_cap_eff:.0f} MW", delta_color="off")
-        c3.metric("aFRR capacity revenue",     f"€{afrr_cap_rev:,.0f}")
+        c3.metric("aFRR capacity revenue", f"€{afrr_cap_rev:,.0f}")
 
-        # Show reservation over time
         daily_rpos = (df_ts["p_afrr_pos_reserved_mw"].resample("D").mean()).reset_index()
         daily_rneg = (df_ts["p_afrr_neg_reserved_mw"].resample("D").mean()).reset_index()
 
         fig = fig_base("Daily Avg aFRR Reservation (MW)", "MW", height=280)
-        fig.add_trace(go.Scatter(
-            x=daily_rpos["timestamp"], y=daily_rpos["p_afrr_pos_reserved_mw"],
-            name="Pos reserved", line=dict(color=COLOURS["afrr_up"], width=1.5),
-        ))
-        fig.add_trace(go.Scatter(
-            x=daily_rneg["timestamp"], y=daily_rneg["p_afrr_neg_reserved_mw"],
-            name="Neg reserved", line=dict(color=COLOURS["afrr_dn"], width=1.5),
-        ))
+        fig.add_trace(go.Scatter(x=daily_rpos["timestamp"], y=daily_rpos["p_afrr_pos_reserved_mw"],
+            name="Pos reserved", line=dict(color=COLOURS["afrr_up"], width=1.5)))
+        fig.add_trace(go.Scatter(x=daily_rneg["timestamp"], y=daily_rneg["p_afrr_neg_reserved_mw"],
+            name="Neg reserved", line=dict(color=COLOURS["afrr_dn"], width=1.5)))
         fig.add_hline(y=ramp_cap_mw, line_dash="dash", line_color="#FF9800",
                       annotation_text=f"Ramp cap {ramp_cap_mw:.0f} MW")
         fig.add_hline(y=pos_max_cfg, line_dash="dot", line_color="#aaa",
