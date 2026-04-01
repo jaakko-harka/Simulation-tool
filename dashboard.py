@@ -403,8 +403,8 @@ with tab_restrictions:
         title="Monthly Restriction Hours",
         height=300, barmode="group",
         yaxis_title="Hours",
-        xaxis=dict(showgrid=True, gridcolor="#eee", tickformat=None),
     )
+    fig.update_xaxes(showgrid=True, gridcolor="#eee")
     st.plotly_chart(fig, use_container_width=True)
 
     # ── Revenue in restricted vs unrestricted slots ───────────────────────────
@@ -472,8 +472,8 @@ with tab_restrictions:
         title="DA Revenue: Restricted vs Free Slots",
         height=320, yaxis_title="€",
         showlegend=False,
-        xaxis=dict(showgrid=False, gridcolor="#eee"),
     )
+    fig.update_xaxes(showgrid=False)
     st.plotly_chart(fig, use_container_width=True)
 
     # ── aFRR ramp-rate cap section ────────────────────────────────────────────
@@ -689,8 +689,8 @@ with tab_results:
         ]:
             fig.add_trace(go.Bar(x=daily_rev["date"], y=daily_rev[col], name=name, marker_color=colour))
         fig.update_layout(**LAYOUT, title="Daily Revenue by Market (€)",
-                          barmode="relative", height=340, yaxis_title="€/day", bargap=0.15,
-                          xaxis=dict(showgrid=True, gridcolor="#eee", tickformat="%b %d"))
+                          barmode="relative", height=340, yaxis_title="€/day", bargap=0.15)
+        fig.update_xaxes(showgrid=True, gridcolor="#eee", tickformat="%b %d")
         st.plotly_chart(fig, use_container_width=True)
 
     # 6 — aFRR activation detail
