@@ -116,24 +116,23 @@ paths:
 
 grid_connection:
   # Export (discharge) restriction
-  export_scenario: "none"        # "none" | "constant" | "solar"
+  export_scenario: "solar"        # "none" | "constant" | "solar"
   export_restriction_hours: 500  # used only for "constant" scenario
-  export_restriction_max_mw: 0   # MW allowed during restriction (0 = full block)
+  export_restriction_max_mw: 60   # MW allowed during restriction (0 = full block)
 
   # Import (charge) restriction
-  import_scenario: "none"        # "none" | "constant" | "demand"
+  import_scenario: "demand"        # "none" | "constant" | "demand"
   import_restriction_hours: 500  # used only for "constant" scenario
-  import_restriction_max_mw: 0   # MW allowed during restriction (0 = full block)
+  import_restriction_max_mw: 60   # MW allowed during restriction (0 = full block)
 
   # Ramp rate → aFRR cap
-  ramp_rate_pct_per_min: 100     # % of power_mw per minute (100 = unrestricted)
+  ramp_rate_pct_per_min: 15     # % of power_mw per minute (100 = unrestricted)
 
 output:
   schedule_file: "schedule_15min_2025.csv"
   daily_summary_file: "summary_daily_2025.csv"
   monthly_summary_file: "summary_monthly_2025.csv"
   kpi_report_file: "kpi_report_2025.txt"
-  kpi_restrictions_file: "kpi_restrictions_2025.txt"
   tso_production_plan_file: "tso_production_plan_2025.csv"
   charts_dir: "charts"
   # Sample week for the detailed chart (YYYY-MM-DD, must be a Monday)
